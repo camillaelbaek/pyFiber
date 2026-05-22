@@ -1,136 +1,210 @@
-#!/usr/bin/env python3
-"""
-run_analysis.py — Command-line entry point for fiber_analysis.
+# fiber_analysis
 
-Usage examples
---------------
-# Single file, auto-detect pixel size from OME metadata
-python run_analysis.py slide01.tif --channels CldU IdU
+Python pipeline for **DNA fiber assay** image analysis.
 
-# Supply pixel size manually and save pretty-printed GeoJSON
+Reads multi-channel microscopy TIFF files, detects and traces replication fibers,
+measures segment lengths per fluorescent channel, classifies replication patterns,
+and exports **GeoJSON overlays** for direct drag-and-drop visualization in **QuPath**.
+
+Inspired by [FiberQ](https://github.com/pierreghesqui/FiberQ) but written entirely
+in Python and operating directly on TIFF files without MATLAB or ImageJ.
+
+---
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+Tested with Python 3.10+.
+
+---
+
+## Quick start
+
+### Single image
+
+```bash
 python run_analysis.py slide01.tif \
     --channels CldU IdU \
     --um-per-px 0.108 \
-    --output-dir results/slide01 \
-    --geojson-indent 2
+    --output-dir results/slide01
+```
 
-# Batch: analyse every .tif in a folder
+Output in `results/slide01/`:
+```
+slide01_segments.csv          # one row per fiber segment
+slide01_fiber_summary.csv     # one row per fiber (class, lengths, ratios)
+slide01_fibers.geojson        # drag onto QuPath for overlay
+```
+
+### Batch processing
+
+```bash
 python run_analysis.py data/*.tif \
     --channels CldU IdU \
     --um-per-px 0.108 \
     --output-dir results/batch
+```
 
-# Tune detection sensitivity
-python run_analysis.py slide01.tif \
+Creates one sub-folder per TIFF plus a combined `batch_fiber_summary.csv`.
+
+### QC figure (tune parameters)
+
+```bash
+python visualize_qc.py slide01.tif \
     --channels CldU IdU \
-    --um-per-px 0.108 \
-    --otsu-factor 0.7 \
-    --tophat-radius 30 \
-    --use-frangi \
-    --min-fiber-length-px 60
-"""
+    --um-per-px 0.108
+```
 
-from __future__ import annotations
+Produces `slide01_qc.png` with 8 panels showing each pipeline step.
 
-import sys
-from pathlib import Path
-from typing import List, Optional
+### Python API
 
-import click
+```python
+from fiber_analysis import run_analysis
 
-from fiber_analysis.pipeline import run_analysis, run_batch
+results = run_analysis(
+    tiff_path     = "slide01.tif",
+    channel_names = ["CldU", "IdU"],
+    um_per_px     = 0.108,
+    output_dir    = "results/slide01",
+)
 
+df   = results["measurements"]   # segment-level DataFrame
+summ = results["summary"]         # fiber-level DataFrame
+gj   = results["geojson"]         # GeoJSON dict
+```
 
-@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
-@click.argument("tiff_paths", nargs=-1, required=True,
-                type=click.Path(exists=True, dir_okay=False))
-@click.option("--channels",         "-c",  multiple=True,
-              default=("CldU", "IdU"), show_default=True,
-              help="Channel names in order (repeat flag, e.g. -c CldU -c IdU).")
-@click.option("--um-per-px",        "-u",  type=float, default=None,
-              help="Physical pixel size in µm/px.  Overrides TIFF metadata.")
-@click.option("--output-dir",       "-o",  type=click.Path(), default=None,
-              help="Output directory.  Defaults to TIFF directory (single) or "
-                   "current directory (batch).")
-# Detection
-@click.option("--tophat-radius",    type=int,   default=25,   show_default=True,
-              help="White top-hat SE radius (px) for background subtraction.")
-@click.option("--gaussian-sigma",   type=float, default=1.0,  show_default=True,
-              help="Gaussian smoothing σ (px).  0 = disabled.")
-@click.option("--otsu-factor",      type=float, default=0.8,  show_default=True,
-              help="Multiply Otsu threshold by this (< 1 = more permissive).")
-@click.option("--min-object-area",  type=int,   default=200,  show_default=True,
-              help="Minimum fiber blob area (px²) — smaller blobs discarded.")
-@click.option("--use-frangi",       is_flag=True, default=False,
-              help="Apply Frangi vesselness filter before thresholding.")
-# Tracing
-@click.option("--min-fiber-length-px", type=int, default=50, show_default=True,
-              help="Minimum skeleton path length in pixels.")
-@click.option("--smooth-window",    type=int,   default=5,    show_default=True,
-              help="Moving-average window for skeleton path smoothing.")
-# Measurement
-@click.option("--min-segment-um",   type=float, default=0.5,  show_default=True,
-              help="Merge / discard segments shorter than this (µm).")
-@click.option("--profile-sigma",    type=float, default=2.0,  show_default=True,
-              help="Gaussian σ applied to intensity profiles before thresholding.")
-# Output
-@click.option("--geojson-indent",   type=int,   default=None,
-              help="JSON indent level (omit for compact output).")
-@click.option("--no-geojson",       is_flag=True, default=False,
-              help="Skip GeoJSON output.")
-@click.option("--no-csv",           is_flag=True, default=False,
-              help="Skip CSV output.")
-@click.option("--quiet", "-q",      is_flag=True, default=False,
-              help="Suppress progress messages.")
-def main(
-    tiff_paths,
-    channels,
-    um_per_px,
-    output_dir,
-    tophat_radius,
-    gaussian_sigma,
-    otsu_factor,
-    min_object_area,
-    use_frangi,
-    min_fiber_length_px,
-    smooth_window,
-    min_segment_um,
-    profile_sigma,
-    geojson_indent,
-    no_geojson,
-    no_csv,
-    quiet,
-):
-    channel_names = list(channels) if channels else None
-    verbose       = not quiet
+---
 
-    common = dict(
-        channel_names          = channel_names,
-        um_per_px              = um_per_px,
-        tophat_radius          = tophat_radius,
-        gaussian_sigma         = gaussian_sigma,
-        otsu_factor            = otsu_factor,
-        min_object_area        = min_object_area,
-        use_frangi             = use_frangi,
-        min_fiber_length_px    = min_fiber_length_px,
-        skeleton_smooth_window = smooth_window,
-        min_segment_length_um  = min_segment_um,
-        smooth_profile_sigma   = profile_sigma,
-        save_measurements      = not no_csv,
-        save_summary           = not no_csv,
-        save_geojson           = not no_geojson,
-        geojson_indent         = geojson_indent,
-        verbose                = verbose,
-    )
+## QuPath overlay
 
-    if len(tiff_paths) == 1:
-        out = Path(output_dir) if output_dir else None
-        run_analysis(tiff_paths[0], output_dir=out, **common)
-    else:
-        out = Path(output_dir) if output_dir else Path.cwd() / "fiber_results"
-        run_batch(list(tiff_paths), output_dir=out,
-                  common_kwargs=common, verbose=verbose)
+1. Open your TIFF in QuPath (drag file onto project or use *File → Open*).
+2. Make sure the image entry is selected.
+3. Drag `<stem>_fibers.geojson` onto the QuPath viewer **or**
+   use *File → Import → Import objects from GeoJSON*.
+4. Fiber backbones appear in grey; channel segments are coloured:
+   - **CldU** → red (`#D62728`)
+   - **IdU** → green (`#2CA02C`)
+5. Click any annotation to see its measurements in the *Annotations* panel.
 
+> **Tip:** QuPath pixel coordinates (0,0) = top-left, which matches NumPy
+> image convention.  The GeoJSON uses `[col, row]` as `[x, y]` — exactly
+> what QuPath expects.
 
-if __name__ == "__main__":
-    main()
+---
+
+## Input TIFF requirements
+
+| Requirement | Notes |
+|---|---|
+| Format | `.tif` / `.tiff` / OME-TIFF |
+| Channels | 2 (typical: CldU + IdU) or more |
+| Bit depth | 8, 12, 16, 32 bit (auto-scaled to [0,1]) |
+| Pixel size | Read from OME-XML; supply `--um-per-px` if absent |
+| Channel order | Positional: first channel = first pulse label |
+| Z-stacks | Max-projection applied automatically |
+
+---
+
+## Key parameters
+
+### Detection (`make_fiber_mask`)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `tophat_radius` | 25 px | Background subtraction scale; increase for uneven backgrounds |
+| `otsu_factor` | 0.8 | < 1 = more signal kept; raise if spurious blobs appear |
+| `min_object_area` | 200 px² | Discard small blobs (nuclei bleed-through, dust) |
+| `use_frangi` | False | Vesselness filter; helps when background is very uneven |
+
+### Tracing (`trace_skeleton`)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `min_fiber_length_px` | 50 px | Discard short skeleton fragments |
+| `smooth_window` | 5 px | Path smoothing; reduce staircase artefacts |
+
+### Measurement (`measure_fibers`)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `min_segment_length_um` | 0.5 µm | Merge/discard label-flicker segments |
+| `smooth_profile_sigma` | 2.0 px | Gaussian σ on intensity profile before thresholding |
+
+---
+
+## Output columns
+
+### `_segments.csv`
+
+| Column | Description |
+|---|---|
+| `fiber_id` | Zero-based fiber index |
+| `segment_id` | Segment index within fiber |
+| `channel` | Channel label (e.g. `CldU`, `IdU`, `unlabelled`) |
+| `length_px` | Segment length in pixels (Euclidean) |
+| `length_um` | Segment length in µm |
+| `start_row`, `start_col` | Start pixel coordinates |
+| `end_row`, `end_col` | End pixel coordinates |
+| `fiber_total_length_um` | Total fiber length (µm) |
+| `fiber_class` | Classification (see below) |
+| `segment_pattern` | Compact pattern string e.g. `CldU→IdU` |
+| `ratio_2nd_1st` | Length(IdU) / Length(CldU) per fiber |
+
+### `_fiber_summary.csv`
+
+One row per fiber, with per-channel length sums added as `length_um_CldU` etc.
+
+---
+
+## Fiber classification scheme
+
+| Class | Pattern | Biology |
+|---|---|---|
+| `ongoing_fork` | ch0 → ch1 (or ch1 → ch0) | Fork active through both pulses |
+| `stalled_first_pulse` | ch0 only | Fork stalled before second pulse |
+| `new_origin` | ch1 only | Origin fired after first pulse |
+| `bidirectional_old` | ch0 → ch1 → ch0 | Bi-directional fork from old origin |
+| `bidirectional_new` | ch1 → ch0 → ch1 | Bi-directional fork from new origin |
+| `restart` | ch0 → ch1 → ch0 → … | Stalled then restarted |
+| `complex` | Any other multi-segment pattern | Inspect manually |
+| `unlabelled` | No labeled segments | Artifact or debris |
+
+Default: ch0 = CldU (first pulse), ch1 = IdU (second pulse).
+
+---
+
+## Package structure
+
+```
+fiber_analysis/
+├── __init__.py      exports run_analysis, load_tiff, write_geojson
+├── io.py            TIFF loading + OME pixel-size extraction
+├── preprocess.py    background subtraction + smoothing
+├── detect.py        fiber mask + skeletonisation
+├── skeleton.py      graph-based skeleton → ordered paths
+├── measure.py       per-channel signal sampling + segment measurement
+├── classify.py      pattern classification + fiber summary
+├── qupath.py        GeoJSON builder (QuPath-compatible)
+└── pipeline.py      run_analysis() + run_batch()
+
+run_analysis.py      CLI entry point (uses Click)
+visualize_qc.py      8-panel QC figure for parameter tuning
+requirements.txt
+```
+
+---
+
+## Tips
+
+* **Start with the QC figure** to tune `otsu_factor` and `tophat_radius`
+  before running a batch.
+* For images with very sparse fibers, try `otsu_factor=0.6–0.7`.
+* For dense images with overlapping fibers, `use_frangi=True` can help.
+* The `min_segment_length_um` parameter is critical for clean classification;
+  values of 0.5–2 µm work well for typical labeling pulses.
+* In QuPath, use *Measure → Show measurement table* after importing GeoJSON
+  to export all fiber measurements to a spreadsheet.
