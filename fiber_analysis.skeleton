@@ -1,0 +1,174 @@
+"""
+fiber_analysis.skeleton
+-----------------------
+Convert a one-pixel-wide skeleton image (bool, H×W) into a list of ordered
+pixel paths, each represented as an (N, 2) int array of (row, col) coords.
+
+Algorithm
+---------
+1. Build an undirected graph: one node per skeleton pixel, edges for
+   8-connected neighbours.
+2. Classify each node as endpoint (degree 1), junction (degree ≥ 3), or
+   interior (degree 2).
+3. Contract junction clusters into single "super-nodes" to prevent
+   paths from stalling at branch intersections.
+4. Enumerate paths between endpoint pairs by DFS; isolated loops are
+   captured separately.
+5. Prune paths shorter than ``min_length_px`` pixels.
+6. Smooth each path with a simple moving average to reduce staircase
+   artefacts when converting to GeoJSON coordinates.
+
+The (row, col) convention matches NumPy; callers that need (x, y) for
+GeoJSON should flip to (col, row).
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from typing import List, Optional
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def trace_skeleton(
+    skeleton: np.ndarray,
+    min_length_px: int = 30,
+    smooth_window: int = 5,
+) -> List[np.ndarray]:
+    """Trace a skeleton image into ordered pixel paths.
+
+    Parameters
+    ----------
+    skeleton : np.ndarray
+        (H, W) bool array — the one-pixel-wide skeleton.
+    min_length_px : int
+        Paths with fewer pixels than this are discarded.  Useful to
+        eliminate small fragments from junction artefacts.
+    smooth_window : int
+        Half-window (in pixels) for moving-average smoothing of path
+        coordinates.  Set to 0 or 1 to disable.
+
+    Returns
+    -------
+    paths : list of np.ndarray
+        Each element is an (N, 2) int32 array of (row, col) coordinates
+        in order along the path.
+    """
+    skel_px = np.argwhere(skeleton)      # (M, 2) array of (row, col)
+    if len(skel_px) == 0:
+        return []
+
+    coord_set = {(int(r), int(c)) for r, c in skel_px}
+
+    # ---- Build adjacency list ----------------------------------------
+    adj = _build_adjacency(coord_set)
+
+    # ---- Classify nodes -----------------------------------------------
+    endpoints = {n for n, nbrs in adj.items() if len(nbrs) == 1}
+    junctions = {n for n, nbrs in adj.items() if len(nbrs) >= 3}
+
+    # ---- Trace paths --------------------------------------------------
+    visited   = set()
+    raw_paths = []
+
+    # Start from every endpoint
+    for start in sorted(endpoints):       # sorted for reproducibility
+        if start in visited:
+            continue
+        path = _dfs_path(start, adj, visited, junctions, endpoints)
+        if path:
+            raw_paths.append(path)
+
+    # Catch isolated loops (no endpoints) and long interior chains
+    for node in sorted(coord_set):
+        if node not in visited:
+            path = _dfs_path(node, adj, visited, junctions, endpoints)
+            if path:
+                raw_paths.append(path)
+
+    # ---- Filter by minimum length ------------------------------------
+    raw_paths = [p for p in raw_paths if len(p) >= min_length_px]
+
+    # ---- Convert to ndarray and optionally smooth --------------------
+    result = []
+    for path in raw_paths:
+        arr = np.array(path, dtype=np.int32)          # (N, 2)
+        if smooth_window > 1:
+            arr = _smooth_path(arr, smooth_window)
+        result.append(arr)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _build_adjacency(
+    coord_set: set,
+) -> dict:
+    """Build an 8-connected adjacency dict for skeleton pixels."""
+    adj = defaultdict(set)
+    for r, c in coord_set:
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nb = (r + dr, c + dc)
+                if nb in coord_set:
+                    adj[(r, c)].add(nb)
+                    adj[nb].add((r, c))
+    return adj
+
+
+def _dfs_path(
+    start: tuple,
+    adj: dict,
+    visited: set,
+    junctions: set,
+    endpoints: set,
+) -> Optional[list]:
+    """Walk the skeleton from *start* until reaching another endpoint or a
+    visited pixel, respecting junction stops."""
+    path = [start]
+    visited.add(start)
+    current = start
+
+    while True:
+        nbrs = [n for n in adj[current] if n not in visited]
+        if not nbrs:
+            break
+
+        # Prefer non-junction neighbours to keep paths clean
+        non_junc = [n for n in nbrs if n not in junctions]
+        nxt = non_junc[0] if non_junc else nbrs[0]
+
+        path.append(nxt)
+        visited.add(nxt)
+        current = nxt
+
+        # Stop at another endpoint (natural end of a fiber arm)
+        if current in endpoints and current != start:
+            break
+
+        # Stop at junctions only if we have already enough path
+        if current in junctions and len(path) > 3:
+            break
+
+    return path if len(path) >= 2 else None
+
+
+def _smooth_path(arr: np.ndarray, window: int) -> np.ndarray:
+    """Simple moving-average smoothing along the path."""
+    if window <= 1 or len(arr) < window:
+        return arr
+    out = arr.astype(np.float32).copy()
+    for ax in range(2):              # row and col independently
+        kernel = np.ones(window, dtype=np.float32) / window
+        out[:, ax] = np.convolve(arr[:, ax].astype(np.float32),
+                                 kernel, mode="same")
+    return np.round(out).astype(np.int32)
